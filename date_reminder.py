@@ -65,9 +65,7 @@ class NoteEditor(tk.Toplevel):
         self.title("Nová poznámka")
         self.geometry("400x450")
         self.on_save_callback = on_save_callback
-        
-        # --- OPRAVA: Tlačítko Uložit umístíme jako první dolů ---
-        # Tím zajistíme, že bude vždy vidět a textové pole ho nepřekryje
+
         btn_frame = ttk.Frame(self, padding=5)
         btn_frame.pack(side="bottom", fill="x")
         
@@ -84,7 +82,7 @@ class NoteEditor(tk.Toplevel):
         ttk.Button(toolbar, text="Seznam", command=lambda: self.insert_formatting("\n- ")).pack(side="left", padx=1)
         ttk.Button(toolbar, text="Odkaz", command=lambda: self.insert_formatting("[Odkaz](url)")).pack(side="left", padx=1)
 
-        # --- Textová oblast (vyplní zbytek místa mezi Toolbarem a Tlačítkem) ---
+        # --- Textová oblast ---
         self.text_input = tk.Text(self, font=("Arial", 11), wrap="word")
         self.text_input.pack(expand=True, fill="both", padx=5, pady=5)
         self.text_input.focus_set()
