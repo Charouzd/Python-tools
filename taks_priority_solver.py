@@ -9,12 +9,16 @@ import uuid
 # --- KONFIGURACE A DATA ---
 DATA_FILE = "tasks.json"
 
+# Barvy pro sortování
+COLOR_SORT_ACTIVE = "#f5f5dc"  # Béžová
+COLOR_SORT_INACTIVE = "#f0f0f0" # Světle šedá (defaultní pozadí)
+
 class TaskManager:
     """Třída pro správu dat (načítání/ukládání JSON) a logiku priorit"""
     def __init__(self):
         self.tasks = self.load_tasks()
+        self.check_watchlist_timeout()
         self.cleanup_old_completed_tasks()
-        # 2) Kontrola priorit při spuštění
         self.check_startup_priorities()
 
     def load_tasks(self):
@@ -38,7 +42,8 @@ class TaskManager:
             "priority": int(priority),
             "description": description,
             "subtasks": [],
-            "completed_date": None 
+            "completed_date": None,
+            "watchlist_date": None 
         }
         self.tasks.append(new_task)
         self.save_tasks()
@@ -52,16 +57,63 @@ class TaskManager:
 
     def delete_task(self, task_id):
         self.tasks = [t for t in self.tasks if t["id"] != task_id]
-        # 1) Po odstranění tasku přepočítat priority ostatním
         self.recalc_priorities_after_change()
         self.save_tasks()
 
-    def mark_as_completed(self, task_id):
+    # --- WATCHLIST A STATUS LOGIKA ---
+
+    def move_to_watchlist(self, task_id):
+        for task in self.tasks:
+            if task["id"] == task_id:
+                task["watchlist_date"] = datetime.now().strftime("%Y-%m-%d")
+                task["completed_date"] = None
+                break
+        self.save_tasks()
+
+    def confirm_watchlist_completion(self, task_id):
+        for task in self.tasks:
+            if task["id"] == task_id:
+                final_date = task.get("watchlist_date") or datetime.now().strftime("%Y-%m-%d")
+                task["completed_date"] = final_date
+                break
+        self.recalc_priorities_after_change()
+        self.save_tasks()
+
+    def return_from_watchlist_bug(self, task_id):
+        for task in self.tasks:
+            if task["id"] == task_id:
+                task["watchlist_date"] = None
+                task["completed_date"] = None
+                task["priority"] = 15
+                task["deadline"] = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+                if "subtasks" not in task:
+                    task["subtasks"] = []
+                task["subtasks"].append({"text": "Opravit bugy (vráceno z Watchlistu)", "done": False})
+                break
+        self.save_tasks()
+
+    def check_watchlist_timeout(self):
+        today = datetime.now().date()
+        changed = False
+        for task in self.tasks:
+            if task.get("watchlist_date") and not task.get("completed_date"):
+                try:
+                    w_date = datetime.strptime(task["watchlist_date"], "%Y-%m-%d").date()
+                    if (today - w_date).days >= 14:
+                        task["completed_date"] = task["watchlist_date"]
+                        changed = True
+                except ValueError:
+                    pass
+        if changed:
+            self.recalc_priorities_after_change()
+            self.save_tasks()
+
+    def mark_as_completed_directly(self, task_id):
         for task in self.tasks:
             if task["id"] == task_id:
                 task["completed_date"] = datetime.now().strftime("%Y-%m-%d")
+                task["watchlist_date"] = None
                 break
-        # 1) Po splnění tasku přepočítat priority ostatním
         self.recalc_priorities_after_change()
         self.save_tasks()
 
@@ -87,25 +139,18 @@ class TaskManager:
             self.tasks = tasks_to_keep
             self.save_tasks()
 
-    # --- NOVÁ LOGIKA ---
-    
     def check_startup_priorities(self):
-        """Logika při startu aplikace"""
         changed = False
         for task in self.tasks:
-            # Ignorovat splněné
-            if task.get("completed_date"):
+            if task.get("completed_date") or task.get("watchlist_date"):
                 continue
             
             days = days_remaining(task['deadline'])
             
-            # Po deadline -> priorita 15
             if days < 0:
                 if task['priority'] != 15:
                     task['priority'] = 15
                     changed = True
-            
-            # Méně než 2 dny -> priorita min. 13
             elif days < 2:
                 if task['priority'] < 13:
                     task['priority'] = 13
@@ -115,26 +160,20 @@ class TaskManager:
             self.save_tasks()
 
     def recalc_priorities_after_change(self):
-        """Logika po splnění/smazání: < 10 dní -> priorita +2 (max 15)"""
         changed = False
         for task in self.tasks:
-            if task.get("completed_date"):
+            if task.get("completed_date") or task.get("watchlist_date"):
                 continue
 
             days = days_remaining(task['deadline'])
             
             if days < 10:
                 old_prio = task['priority']
-                # Zvyšujeme pouze pokud ještě není 15 nebo víc
                 if old_prio < 15:
                     new_prio = min(15, old_prio + 2)
                     if new_prio != old_prio:
                         task['priority'] = new_prio
                         changed = True
-        
-        # Poznámka: self.save_tasks() se volá v parent metodě (delete/mark_as_completed),
-        # ale pro jistotu, pokud by se volalo odjinud:
-        # (Zde to nevadí, data jsou v paměti a uloží se o krok dál)
 
 # --- POMOCNÉ FUNKCE ---
 def get_priority_color(priority):
@@ -170,13 +209,11 @@ class TaskDetailWindow(tk.Toplevel):
         
         self.is_completed = task_data.get("completed_date") is not None
         
-        # --- GUI Elements ---
         tk.Label(self, text="Název úkolu:").pack(pady=5)
         self.title_entry = tk.Entry(self, width=50)
         self.title_entry.insert(0, task_data['title'])
         self.title_entry.pack()
 
-        # --- SEKCE DATUM ---
         tk.Label(self, text="Deadline:").pack(pady=5)
         date_frame = tk.Frame(self)
         date_frame.pack()
@@ -310,6 +347,12 @@ class TaskApp(tk.Frame):
         super().__init__(parent)
         self.parent = parent
         self.manager = TaskManager()
+        
+        # --- STAV ŘAZENÍ ---
+        # 0 = Off (Default), 1 = Descending, 2 = Ascending
+        self.sort_state = 0 
+        self.active_sort_col = None # 'priority', 'deadline' nebo None
+
         self.pack(fill="both", expand=True)
         
         header = tk.Frame(self)
@@ -327,10 +370,7 @@ class TaskApp(tk.Frame):
         )
 
         self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        
-        # Aby se grid roztáhl přes celou šířku canvasu
         self.canvas.bind('<Configure>', lambda e: self.canvas.itemconfig(self.canvas.find_all()[0], width=e.width))
-
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
 
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -339,70 +379,162 @@ class TaskApp(tk.Frame):
         self.refresh_list()
 
     def configure_grid_columns(self, container):
-        """Nastaví pevné šířky sloupců pro zarovnání tabulky"""
         container.grid_columnconfigure(0, weight=0, minsize=50) # Prio
         container.grid_columnconfigure(1, weight=1)             # Nazev
         container.grid_columnconfigure(2, weight=0, minsize=100)# Deadline
         container.grid_columnconfigure(3, weight=0, minsize=100)# Zbyva
-        container.grid_columnconfigure(4, weight=0, minsize=50) # Akce
+        container.grid_columnconfigure(4, weight=0, minsize=120)# Akce
+
+    # --- LOGIKA TŘÍSTAVOVÉHO ŘAZENÍ ---
+    def cycle_sort(self, col_name):
+        """Cyklení: 1. Desc -> 2. Asc -> 3. Off"""
+        if self.active_sort_col != col_name:
+            # Nový sloupec -> začínáme sestupně
+            self.active_sort_col = col_name
+            self.sort_state = 1
+        else:
+            # Stejný sloupec -> posun stavu
+            self.sort_state += 1
+            if self.sort_state > 2:
+                self.sort_state = 0 # Reset na default
+                self.active_sort_col = None
+
+        self.refresh_list()
+
+    def get_header_visuals(self, col_name):
+        """Vrátí (text_symbol, bg_color) pro daný sloupec"""
+        if self.active_sort_col == col_name and self.sort_state != 0:
+            bg = COLOR_SORT_ACTIVE
+            if self.sort_state == 1:
+                sym = "▼" # Sestupně
+            else:
+                sym = "▲" # Vzestupně
+        else:
+            bg = COLOR_SORT_INACTIVE
+            sym = "►" # Možnost řadit
+        
+        return sym, bg
 
     def refresh_list(self):
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
 
         tasks = self.manager.tasks
-        active_tasks = [t for t in tasks if not t.get("completed_date")]
+        
+        active_tasks = [t for t in tasks if not t.get("completed_date") and not t.get("watchlist_date")]
+        watchlist_tasks = [t for t in tasks if t.get("watchlist_date") and not t.get("completed_date")]
         completed_tasks = [t for t in tasks if t.get("completed_date")]
 
+        # --- APLIKACE ŘAZENÍ NA AKTIVNÍ ÚKOLY ---
+        
+        # Defaultní řazení (pokud je sort_state 0 nebo None)
+        # Priorita (Desc) -> Deadline (Asc)
         active_tasks.sort(key=lambda x: (x['priority'], -days_remaining(x['deadline'])), reverse=True)
+
+        if self.active_sort_col and self.sort_state != 0:
+            is_reverse = (self.sort_state == 1) # 1 = Descending (True), 2 = Ascending (False)
+            
+            if self.active_sort_col == 'priority':
+                # Priorita
+                active_tasks.sort(key=lambda x: x['priority'], reverse=is_reverse)
+            
+            elif self.active_sort_col == 'deadline':
+                # Deadline (používáme dny zbývající pro přesnost)
+                # POZOR: Deadline "Sestupně" (▼) znamená od nejvzdálenější budoucnosti k dnešku? 
+                # Obvykle v tabulkách ▼ (Desc) znamená 9->0 nebo Z->A.
+                # U data je Descending = Nejnovější (Future) -> Nejstarší (Past).
+                active_tasks.sort(key=lambda x: days_remaining(x['deadline']), reverse=is_reverse)
+
+        # Watchlist a Completed řadíme vždy chronologicky
+        watchlist_tasks.sort(key=lambda x: x['watchlist_date'], reverse=True)
         completed_tasks.sort(key=lambda x: x['completed_date'], reverse=True)
 
-        # --- HLAVIČKA ---
-        self.create_headers()
+        # --- VYKRESLENÍ ---
+        self.create_section_label("Aktivní úkoly")
+        self.create_headers(is_active_section=True)
         
         if not active_tasks:
-            tk.Label(self.scrollable_frame, text="Žádné aktivní úkoly", fg="grey").pack(pady=10)
-        
+            tk.Label(self.scrollable_frame, text="Žádné aktivní úkoly", fg="grey").pack(pady=5)
         for task in active_tasks:
-            self.create_task_row(task, is_completed=False)
+            self.create_task_row(task, status="active")
 
-        # --- ODĚLOVAČ ---
-        if completed_tasks:
-            sep = tk.Frame(self.scrollable_frame, height=2, bg="black")
-            sep.pack(fill="x", pady=(20, 5))
-            tk.Label(self.scrollable_frame, text="Splněné úkoly (posledních 31 dní)", 
-                     font=("Arial", 10, "italic")).pack(anchor="w", padx=5)
+        # --- OSTATNÍ SEKCE ---
+        self.create_separator()
+        self.create_section_label("Watchlist (Čeká na kontrolu - max 14 dní)")
+        self.create_headers(is_active_section=False)
+        if not watchlist_tasks:
+             tk.Label(self.scrollable_frame, text="Žádné úkoly ve watchlistu", fg="grey").pack(pady=5)
+        for task in watchlist_tasks:
+            self.create_task_row(task, status="watchlist")
 
+        self.create_separator()
+        self.create_section_label("Splněné úkoly (Archiv)")
+        self.create_headers(is_active_section=False)
         for task in completed_tasks:
-            self.create_task_row(task, is_completed=True)
+            self.create_task_row(task, status="completed")
 
-    def create_headers(self):
+    def create_section_label(self, text):
+        f = tk.Frame(self.scrollable_frame, bg="#eeeeee")
+        f.pack(fill="x", pady=(10, 5))
+        tk.Label(f, text=text, font=("Arial", 12, "bold", "italic"), bg="#eeeeee").pack(anchor="w", padx=5, pady=2)
+
+    def create_separator(self):
+        tk.Frame(self.scrollable_frame, height=2, bg="black").pack(fill="x", pady=10)
+
+    def create_headers(self, is_active_section=False):
         headers_frame = tk.Frame(self.scrollable_frame)
         headers_frame.pack(fill="x", pady=2, padx=5)
-        
         self.configure_grid_columns(headers_frame)
         
-        tk.Label(headers_frame, text="Prio", font="bold").grid(row=0, column=0, sticky="w")
-        tk.Label(headers_frame, text="Název úkolu", font="bold").grid(row=0, column=1, sticky="w")
-        tk.Label(headers_frame, text="Deadline", font="bold").grid(row=0, column=2)
-        tk.Label(headers_frame, text="Zbývá", font="bold").grid(row=0, column=3)
-        tk.Label(headers_frame, text="Akce", font="bold").grid(row=0, column=4)
+        # Pomocná funkce pro vytvoření klikací hlavičky
+        def create_clickable_header(col_key, text_base, col_index):
+            if is_active_section:
+                sym, bg = self.get_header_visuals(col_key)
+                text_full = f"{text_base} {sym}"
+                
+                # Container pro pozadí
+                h_cont = tk.Frame(headers_frame, bg=bg, bd=1, relief="raised")
+                h_cont.grid(row=0, column=col_index, sticky="nsew")
+                
+                lbl = tk.Label(h_cont, text=text_full, font=("Arial", 9, "bold"), bg=bg, cursor="hand2")
+                lbl.pack(fill="both", expand=True, padx=5, pady=2)
+                
+                # Bind click na label i frame
+                for w in (h_cont, lbl):
+                    w.bind("<Button-1>", lambda e: self.cycle_sort(col_key))
+            else:
+                # Statická hlavička pro neaktivní sekce
+                tk.Label(headers_frame, text=text_base, font=("Arial", 9, "bold")).grid(row=0, column=col_index, sticky="w", padx=5)
 
-    def create_task_row(self, task, is_completed):
-        if is_completed:
+        # 0: Prio
+        create_clickable_header('priority', "Prio", 0)
+        
+        # 1: Název (Není sortovatelný dle zadání, ale můžeme nechat statický)
+        tk.Label(headers_frame, text="Název úkolu", font=("Arial", 9, "bold")).grid(row=0, column=1, sticky="w", padx=5)
+        
+        # 2: Deadline
+        create_clickable_header('deadline', "Deadline", 2)
+        
+        # 3, 4: Ostatní
+        tk.Label(headers_frame, text="Info", font=("Arial", 9, "bold")).grid(row=0, column=3, sticky="w", padx=5)
+        tk.Label(headers_frame, text="Akce", font=("Arial", 9, "bold")).grid(row=0, column=4, sticky="w", padx=5)
+
+    def create_task_row(self, task, status):
+        if status == 'completed':
             color = "#d3d3d3"
             fg_color = "#666666"
             relief = "flat"
+        elif status == 'watchlist':
+            color = "#fffacd"
+            fg_color = "black"
+            relief = "solid"
         else:
             color = get_priority_color(task['priority'])
             fg_color = "black"
             relief = "raised"
 
-        days = days_remaining(task['deadline'])
-        
         row = tk.Frame(self.scrollable_frame, bg=color, pady=5, padx=5, bd=1, relief=relief)
         row.pack(fill="x", pady=2, padx=5)
-        
         self.configure_grid_columns(row)
 
         def on_click(e):
@@ -417,26 +549,58 @@ class TaskApp(tk.Frame):
         l_dead = tk.Label(row, text=task['deadline'], bg=color, fg=fg_color)
         l_dead.grid(row=0, column=2, sticky="nsew")
         
-        days_text = f"{days} dní" if not is_completed else task["completed_date"]
-        l_days = tk.Label(row, text=days_text, bg=color, fg=fg_color)
+        if status == 'active':
+            days = days_remaining(task['deadline'])
+            info_text = f"{days} dní"
+        elif status == 'watchlist':
+            info_text = f"WL: {task['watchlist_date']}"
+        else:
+            info_text = f"OK: {task['completed_date']}"
+            
+        l_days = tk.Label(row, text=info_text, bg=color, fg=fg_color)
         l_days.grid(row=0, column=3, sticky="nsew")
 
-        # Tlačítko AKCE
+        # --- TLAČÍTKA ---
         action_container = tk.Frame(row, bg=color) 
         action_container.grid(row=0, column=4, sticky="nsew")
         
-        if not is_completed:
-            btn_done = tk.Button(action_container, text="✔", bg="white", fg="green", font=("Arial", 9, "bold"),
-                                 width=3, command=lambda: self.try_complete_task(task))
-            btn_done.pack(expand=True)
-        else:
+        if status == 'active':
+            btn_wl = tk.Button(action_container, text="👁 WL", bg="white", fg="blue", font=("Arial", 8, "bold"),
+                            width=4, command=lambda: self.try_move_to_watchlist(task))
+            btn_wl.pack(side=tk.LEFT, padx=2)
+            
+            btn_done = tk.Button(action_container, text="✔", bg="#ccffcc", fg="green", font=("Arial", 8, "bold"),
+                                 width=3, command=lambda: self.try_complete_directly(task))
+            btn_done.pack(side=tk.LEFT, padx=2)
+            
+        elif status == 'watchlist':
+            btn_bug = tk.Button(action_container, text="🐛", bg="#ffcccc", fg="red", width=2,
+                                command=lambda: self.report_bug(task))
+            btn_bug.pack(side=tk.LEFT, padx=2)
+            btn_ok = tk.Button(action_container, text="✔", bg="#ccffcc", fg="green", width=2,
+                               command=lambda: self.confirm_complete(task))
+            btn_ok.pack(side=tk.LEFT, padx=2)
+            
+        else: 
             tk.Label(action_container, text="✓", bg=color, fg="green", font=("Arial", 12, "bold")).pack(expand=True)
 
         for widget in (row, l_prio, l_title, l_dead, l_days, action_container):
             widget.bind("<Button-1>", on_click)
             widget.configure(cursor="hand2")
 
-    def try_complete_task(self, task):
+    def try_move_to_watchlist(self, task):
+        subtasks = task.get("subtasks", [])
+        if subtasks:
+            not_done = [s for s in subtasks if not s["done"]]
+            if not_done:
+                messagebox.showwarning("Nelze přesunout", "Nemáte hotové všechny podúkoly!")
+                return
+        
+        if messagebox.askyesno("Watchlist", f"Přesunout úkol '{task['title']}' do Watchlistu ke kontrole?"):
+            self.manager.move_to_watchlist(task["id"])
+            self.refresh_list()
+
+    def try_complete_directly(self, task):
         subtasks = task.get("subtasks", [])
         if subtasks:
             not_done = [s for s in subtasks if not s["done"]]
@@ -444,8 +608,18 @@ class TaskApp(tk.Frame):
                 messagebox.showwarning("Nelze splnit", "Nemáte hotové všechny podúkoly!")
                 return
         
-        if messagebox.askyesno("Dokončit", f"Opravdu označit úkol '{task['title']}' jako splněný?"):
-            self.manager.mark_as_completed(task["id"])
+        if messagebox.askyesno("Hotovo", f"Splnit úkol '{task['title']}' IHNED (bez Watchlistu)?"):
+            self.manager.mark_as_completed_directly(task["id"])
+            self.refresh_list()
+
+    def confirm_complete(self, task):
+        if messagebox.askyesno("Hotovo", "Vše v pořádku? Označit jako definitivně splněné?"):
+            self.manager.confirm_watchlist_completion(task["id"])
+            self.refresh_list()
+
+    def report_bug(self, task):
+        if messagebox.askyesno("Bug", "Vrátit úkol zpět k opravě (Aktivní, Prio 15)?"):
+            self.manager.return_from_watchlist_bug(task["id"])
             self.refresh_list()
 
     def create_new_task(self):
@@ -456,7 +630,8 @@ class TaskApp(tk.Frame):
             "priority": 10,
             "description": "",
             "subtasks": [],
-            "completed_date": None
+            "completed_date": None,
+            "watchlist_date": None
         }
         self.manager.tasks.append(dummy_task)
         self.manager.save_tasks()
@@ -466,6 +641,6 @@ class TaskApp(tk.Frame):
 if __name__ == "__main__":
     root = tk.Tk()
     root.title("Task Priority Solver")
-    root.geometry("700x600")
+    root.geometry("750x700")
     app = TaskApp(root)
     root.mainloop()
